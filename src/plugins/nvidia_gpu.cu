@@ -40,6 +40,6 @@ bool synthesize(const FsoyGpuFrameJob* job) {
   cudaFree(d_y);
   return ok;
 }
-FsoyGpuPluginApi api{FSOY_GPU_PLUGIN_ABI_VERSION, "NVIDIA GPU Suite (CUDA)", status, available, synthesize};
+FsoyGpuPluginApi api{FSOY_GPU_PLUGIN_ABI_VERSION, "fsoy-nvidia-gpu-cuda", status, available, synthesize};
 }
 extern "C" const FsoyGpuPluginApi* fsoy_get_gpu_plugin_api() { return &api; }

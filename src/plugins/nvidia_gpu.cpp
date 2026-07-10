@@ -20,7 +20,7 @@ bool nvidia_driver_present() {
   return true;
 #endif
 }
-const char* status() { return nvidia_driver_present() ? "NVIDIA CUDA driver detected; luma synthesis suite active" : "NVIDIA CUDA driver not detected"; }
+const char* status() { return nvidia_driver_present() ? "NVIDIA CUDA driver detected; luma synthesis plugin active" : "NVIDIA CUDA driver not detected"; }
 bool synthesize(const FsoyGpuFrameJob* job) {
   if (!job || !job->y_plane || !job->payload) return false;
   if (!nvidia_driver_present()) return false;
@@ -39,6 +39,6 @@ bool synthesize(const FsoyGpuFrameJob* job) {
   }
   return true;
 }
-FsoyGpuPluginApi api{FSOY_GPU_PLUGIN_ABI_VERSION, "NVIDIA GPU Suite", status, nvidia_driver_present, synthesize};
+FsoyGpuPluginApi api{FSOY_GPU_PLUGIN_ABI_VERSION, "fsoy-nvidia-gpu", status, nvidia_driver_present, synthesize};
 }
 extern "C" const FsoyGpuPluginApi* fsoy_get_gpu_plugin_api() { return &api; }

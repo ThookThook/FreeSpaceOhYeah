@@ -36,16 +36,11 @@ vector<string> candidates(const string& explicit_path) {
   vector<string> out;
   if (const char* env = getenv("FSOY_GPU_PLUGIN")) out.emplace_back(env);
 #if defined(_WIN32)
-  out.emplace_back("fsoy_gpu_nvidia.dll");
   out.emplace_back("fsoy_nvidia_gpu.dll");
 #elif defined(__APPLE__)
-  out.emplace_back("./libfsoy_gpu_nvidia.dylib");
-  out.emplace_back("libfsoy_gpu_nvidia.dylib");
   out.emplace_back("./libfsoy_nvidia_gpu.dylib");
   out.emplace_back("libfsoy_nvidia_gpu.dylib");
 #else
-  out.emplace_back("./libfsoy_gpu_nvidia.so");
-  out.emplace_back("libfsoy_gpu_nvidia.so");
   out.emplace_back("./libfsoy_nvidia_gpu.so");
   out.emplace_back("libfsoy_nvidia_gpu.so");
 #endif
