@@ -27,8 +27,89 @@ string normalize_gpu_mode(const string& mode){
  return "off";
 } bool have_ffmpeg(){return system("command -v ffmpeg >/dev/null 2>&1")==0;} uint64_t parse_size(string s){if(s.empty())die("bad size value"); uint64_t m=1; char c=s.back(); if(!isdigit(static_cast<unsigned char>(c))){s.pop_back(); if(c=='K')m=1024; else if(c=='M')m=1024ull*1024; else if(c=='G')m=1024ull*1024*1024; else die("bad size suffix");} if(s.empty())die("bad size value"); return stoull(s)*m;}
 void put64(vector<uint8_t>&v,uint64_t x){for(int i=0;i<8;i++)v.push_back((x>>(i*8))&255);} uint64_t get64(const vector<uint8_t>&v,size_t p){uint64_t x=0; for(int i=7;i>=0;i--)x=(x<<8)|v[p+i]; return x;}
+void put32(vector<uint8_t>&v,uint32_t x){for(int i=0;i<4;i++)v.push_back((x>>(i*8))&255);} uint32_t get32(const vector<uint8_t>&v,size_t p){uint32_t x=0; for(int i=3;i>=0;i--)x=(x<<8)|v[p+i]; return x;}
 uint32_t checksum32(const uint8_t* data,size_t n){uint32_t h=2166136261u; for(size_t i=0;i<n;i++){h^=data[i]; h*=16777619u;} return h;}
 array<uint8_t,32> file_sha(const string&p){ifstream f(p,ios::binary); if(!f)die("cannot open "+p); Sha256 s; vector<uint8_t>b(1<<20); while(f){f.read((char*)b.data(),b.size()); if(f.gcount())s.update(b.data(),f.gcount());} return s.final();}
+// HARE v1 stream layout: magic(9) | orig_size u64(8) | sha256(32) | num_data_chunks u64(8) | chunk_size u32(4) | ecc_group u32(4)
+// then per ECC group: g data chunks of [checksum32(4) + chunk_size bytes], followed by one parity chunk [checksum32(4) + chunk_size bytes]
+// where g = min(ecc_group, chunks remaining) and parity = XOR of that group's g data chunks (zero-padded).
+// This gives single-chunk erasure/corruption recovery per group, at ~1/ecc_group (10%) storage overhead, matching the README's design.
+vector<uint8_t> build_hare_stream(const string&input_path,uint64_t&out_sz,array<uint8_t,32>&out_sha){
+ out_sz=fs::file_size(input_path); out_sha=file_sha(input_path);
+ vector<uint8_t> file_bytes(out_sz);
+ if(out_sz){ ifstream f(input_path,ios::binary); if(!f)die("cannot open "+input_path); f.read((char*)file_bytes.data(),(streamsize)out_sz); }
+ uint64_t num_data_chunks = out_sz==0 ? 1 : (out_sz+CHUNK_SIZE-1)/CHUNK_SIZE;
+ vector<uint8_t> stream; string magic="FSOYHARE1";
+ stream.insert(stream.end(),magic.begin(),magic.end());
+ put64(stream,out_sz); stream.insert(stream.end(),out_sha.begin(),out_sha.end());
+ put64(stream,num_data_chunks); put32(stream,(uint32_t)CHUNK_SIZE); put32(stream,(uint32_t)ECC_GROUP);
+ uint64_t idx=0;
+ while(idx<num_data_chunks){
+  uint64_t g=min<uint64_t>(ECC_GROUP,num_data_chunks-idx);
+  vector<uint8_t> parity(CHUNK_SIZE,0);
+  for(uint64_t j=0;j<g;j++){
+   vector<uint8_t> chunk(CHUNK_SIZE,0);
+   uint64_t off=(idx+j)*CHUNK_SIZE;
+   uint64_t avail = off<out_sz ? min<uint64_t>(CHUNK_SIZE,out_sz-off) : 0;
+   if(avail) memcpy(chunk.data(),file_bytes.data()+off,avail);
+   for(size_t b=0;b<CHUNK_SIZE;b++) parity[b]^=chunk[b];
+   put32(stream,checksum32(chunk.data(),chunk.size()));
+   stream.insert(stream.end(),chunk.begin(),chunk.end());
+  }
+  put32(stream,checksum32(parity.data(),parity.size()));
+  stream.insert(stream.end(),parity.begin(),parity.end());
+  idx+=g;
+ }
+ return stream;
+}
+// Inverse of build_hare_stream. Verifies each chunk's checksum; if exactly one chunk (data or parity) in a
+// group fails, repairs a bad data chunk via XOR of the group's other chunks + parity. More than one failure
+// per group is beyond this scheme's repair capacity and is reported as an unrecoverable error.
+vector<uint8_t> reconstruct_hare_stream(const vector<uint8_t>&bytes,uint64_t&out_sz,array<uint8_t,32>&out_sha){
+ if(bytes.size()<9 || string(bytes.begin(),bytes.begin()+9)!="FSOYHARE1") die("not an FSOY HARE v1 stream");
+ if(bytes.size()<9+8+32+8+4+4) die("truncated HARE stream header");
+ size_t pos=9;
+ out_sz=get64(bytes,pos); pos+=8;
+ copy(bytes.begin()+pos,bytes.begin()+pos+32,out_sha.begin()); pos+=32;
+ uint64_t num_data_chunks=get64(bytes,pos); pos+=8;
+ uint32_t chunk_size=get32(bytes,pos); pos+=4;
+ uint32_t ecc_group=get32(bytes,pos); pos+=4;
+ if(chunk_size==0||ecc_group==0) die("corrupt HARE stream header (zero chunk_size/ecc_group)");
+ vector<uint8_t> out; out.reserve((size_t)min<uint64_t>(num_data_chunks*(uint64_t)chunk_size, (uint64_t)1<<34));
+ uint64_t idx=0, group=0;
+ while(idx<num_data_chunks){
+  uint64_t g=min<uint64_t>(ecc_group,num_data_chunks-idx);
+  vector<vector<uint8_t>> chunks(g); vector<bool> ok(g,false);
+  for(uint64_t j=0;j<g;j++){
+   if(pos+4+chunk_size>bytes.size()) die("truncated HARE stream in group "+to_string(group));
+   uint32_t stored=get32(bytes,pos); pos+=4;
+   chunks[j].assign(bytes.begin()+pos,bytes.begin()+pos+chunk_size); pos+=chunk_size;
+   ok[j]=(checksum32(chunks[j].data(),chunks[j].size())==stored);
+  }
+  if(pos+4+chunk_size>bytes.size()) die("truncated HARE stream (missing parity) in group "+to_string(group));
+  uint32_t parity_stored=get32(bytes,pos); pos+=4;
+  vector<uint8_t> parity(bytes.begin()+pos,bytes.begin()+pos+chunk_size); pos+=chunk_size;
+  bool parity_ok=(checksum32(parity.data(),parity.size())==parity_stored);
+  int bad=0; int bad_idx=-1;
+  for(uint64_t j=0;j<g;j++) if(!ok[j]){bad++; bad_idx=(int)j;}
+  if(!parity_ok) bad++;
+  if(bad==0 || (bad==1 && !parity_ok)){
+   for(uint64_t j=0;j<g;j++) out.insert(out.end(),chunks[j].begin(),chunks[j].end());
+  } else if(bad==1 && bad_idx>=0){
+   vector<uint8_t> recovered=parity;
+   for(uint64_t j=0;j<g;j++) if((int)j!=bad_idx) for(size_t b=0;b<chunk_size;b++) recovered[b]^=chunks[j][b];
+   chunks[bad_idx]=recovered;
+   cerr<<"Repaired chunk "<<(idx+bad_idx)<<" in ECC group "<<group<<" using XOR parity.\n";
+   for(uint64_t j=0;j<g;j++) out.insert(out.end(),chunks[j].begin(),chunks[j].end());
+  } else {
+   die("unrecoverable corruption in ECC group "+to_string(group)+": more than one chunk failed checksum (this scheme repairs at most 1 bad chunk per group of "+to_string(g)+")");
+  }
+  idx+=g; group++;
+ }
+ if(out.size()<out_sz) die("reconstructed stream shorter than recorded size");
+ out.resize(out_sz);
+ return out;
+}
 string json_escape(const string&s){string o; for(char ch:s){if(ch=='\\'||ch=='"') {o.push_back('\\'); o.push_back(ch);} else if(ch=='\n') o+="\\n"; else o.push_back(ch);} return o;}
 string checkpoint_field(const string&path,const string&key){ifstream f(path); if(!f)die("cannot open checkpoint "+path); string data((istreambuf_iterator<char>(f)),{}); string needle="\""+key+"\""; size_t p=data.find(needle); if(p==string::npos)return {}; p=data.find(':',p); if(p==string::npos)return {}; p=data.find('"',p); if(p==string::npos)return {}; size_t e=data.find('"',p+1); if(e==string::npos)return {}; return data.substr(p+1,e-p-1);}
 void encode_checkpoint(const string&path,const string&src,const string&out,uint64_t size,const array<uint8_t,32>&sha,const string&status,uint64_t byte_offset){ofstream c(path); c<<"{\n  \"type\": \"encode\",\n  \"source_path\": \""<<json_escape(src)<<"\",\n  \"source_size\": "<<size<<",\n  \"sha256\": \""<<Sha256::hex(sha)<<"\",\n  \"hare_version\": 1,\n  \"block_size\": 4,\n  \"ecc_ratio\": 0.10,\n  \"fps\": 24,\n  \"byte_offset\": "<<byte_offset<<",\n  \"volume_index\": 1,\n  \"output_path\": \""<<json_escape(out)<<"\",\n  \"outputs\": [\""<<json_escape(out)<<"\"],\n  \"status\": \""<<status<<"\"\n}\n";}
@@ -51,9 +132,9 @@ int encode(const Opt&o){
  }
  if(o.gpu=="auto") cerr<<"GPU process suite requested; frame synthesis and NVENC will be attempted with CPU fallback where possible.\n";
  if(o.gpu=="encode") cerr<<"GPU encode requested; NVENC will be attempted and CPU libx264 used if unavailable.\n";
- uint64_t sz=fs::file_size(o.input); auto sha=file_sha(o.input); vector<uint8_t> payload; string magic="FSOYHARE1"; payload.insert(payload.end(),magic.begin(),magic.end()); put64(payload,sz); payload.insert(payload.end(),sha.begin(),sha.end()); ifstream f(o.input,ios::binary); vector<uint8_t>b(1<<20); while(f){f.read((char*)b.data(),b.size()); payload.insert(payload.end(),b.begin(),b.begin()+f.gcount());}
+ uint64_t sz; array<uint8_t,32> sha; vector<uint8_t> payload=build_hare_stream(o.input,sz,sha);
  string cmd=ffmpeg_encode_cmd(o.output,o.gpu); FILE*p=popen(cmd.c_str(),"w"); if(!p)die("failed to start ffmpeg"); fprintf(p,"YUV4MPEG2 W%d H%d F%d:1 Ip A1:1 C420jpeg\n",W,H,FPS); for(size_t off=0;off<payload.size();off+=BYTES_PER_FRAME) write_frame(p,payload,off,frame_gpu); int rc=pclose(p); if(rc!=0 && (o.gpu=="auto"||o.gpu=="encode")){ cerr<<"GPU encode failed; retrying with CPU libx264.\n"; Opt c=o; c.gpu="off"; return encode(c);} if(rc!=0){ encode_checkpoint(o.output+".encode.checkpoint",o.input,o.output,sz,sha,"failed",payload.size()); die("ffmpeg encode failed"); } encode_checkpoint(o.output+".encode.checkpoint",o.input,o.output,sz,sha,"complete",payload.size()); return 0;}
 string ffmpeg_decode_cmd(const string&i){return "ffmpeg -hide_banner -loglevel error -i '"+i+"' -f rawvideo -pix_fmt gray -";}
-int decode(const Opt&o){if(!have_ffmpeg()) die("ffmpeg is required on PATH for MP4 encode/decode"); vector<uint8_t> bytes; for(auto&in:o.inputs){FILE*p=popen(ffmpeg_decode_cmd(in).c_str(),"r"); if(!p)die("failed to start ffmpeg"); vector<uint8_t> y(W*H); while(fread(y.data(),1,y.size(),p)==y.size()){uint8_t cur=0; int n=0; for(size_t bi=0;bi<BLOCKS;bi++){int bx=(bi%(W/BLOCK))*BLOCK, by=(bi/(W/BLOCK))*BLOCK; cur=(cur<<1)|(y[by*W+bx]>127); if(++n==8){bytes.push_back(cur); cur=0; n=0;}}} pclose(p);} if(bytes.size()<49 || string(bytes.begin(),bytes.begin()+9)!="FSOYHARE1") die("not an FSOY HARE v1 stream"); uint64_t sz=get64(bytes,9); array<uint8_t,32> sha{}; copy(bytes.begin()+17,bytes.begin()+49,sha.begin()); if(sz>bytes.size()-49)die("truncated stream"); ofstream out(o.output,ios::binary); out.write((char*)bytes.data()+49,sz); out.close(); auto got=file_sha(o.output); if(got!=sha){ decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(sha),"failed"); die("SHA-256 verification failed: got "+Sha256::hex(got)+" expected "+Sha256::hex(sha)); } decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(got),"complete"); cerr<<"Verified SHA-256 "<<Sha256::hex(got)<<"\n"; return 0;}
+int decode(const Opt&o){if(!have_ffmpeg()) die("ffmpeg is required on PATH for MP4 encode/decode"); vector<uint8_t> bytes; for(auto&in:o.inputs){FILE*p=popen(ffmpeg_decode_cmd(in).c_str(),"r"); if(!p)die("failed to start ffmpeg"); vector<uint8_t> y(W*H); while(fread(y.data(),1,y.size(),p)==y.size()){uint8_t cur=0; int n=0; for(size_t bi=0;bi<BLOCKS;bi++){int bx=(bi%(W/BLOCK))*BLOCK, by=(bi/(W/BLOCK))*BLOCK; cur=(cur<<1)|(y[by*W+bx]>127); if(++n==8){bytes.push_back(cur); cur=0; n=0;}}} pclose(p);} uint64_t sz; array<uint8_t,32> sha{}; vector<uint8_t> payload=reconstruct_hare_stream(bytes,sz,sha); ofstream out(o.output,ios::binary); out.write((char*)payload.data(),(streamsize)payload.size()); out.close(); auto got=file_sha(o.output); if(got!=sha){ decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(sha),"failed"); die("SHA-256 verification failed: got "+Sha256::hex(got)+" expected "+Sha256::hex(sha)); } decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(got),"complete"); cerr<<"Verified SHA-256 "<<Sha256::hex(got)<<"\n"; return 0;}
 Opt parse(int argc,char**argv){ if(argc<2)die("usage: fsoy encode <file> -o <out.mp4> | fsoy decode <mp4...> -o <file>"); Opt o; o.mode=argv[1]; for(int i=2;i<argc;i++){string a=argv[i]; if(a=="-o"&&i+1<argc)o.output=argv[++i]; else if(a=="--gpu"&&i+1<argc)o.gpu=normalize_gpu_mode(argv[++i]); else if(a=="--gpu-plugin"&&i+1<argc)o.gpu_plugin=argv[++i]; else if(a=="--max-output-size"&&i+1<argc)o.max_size=parse_size(argv[++i]); else if(a=="--auto-continue")o.auto_continue=true; else if(a=="--resume"&&i+1<argc){o.resume=true; o.checkpoint=argv[++i];} else if(a=="--checkpoint"&&i+1<argc){o.ckdecode=true; o.checkpoint=argv[++i];} else if(o.mode=="decode")o.inputs.push_back(a); else if(o.input.empty())o.input=a; else die("unexpected arg "+a);} if(o.mode=="encode"&&!o.resume&&(o.input.empty()||o.output.empty()))die("encode needs input and -o"); if(o.mode=="decode"&&(o.inputs.empty()||o.output.empty()))die("decode needs input video(s) and -o"); return o;}
 int main(int argc,char**argv){try{Opt o=parse(argc,argv); if(o.max_size) cerr<<"--max-output-size is recorded in checkpoint; v1 scaffold writes one feed volume.\n"; if(o.resume) die("resume from checkpoint is scaffolded but not yet executable"); if(o.ckdecode) die("decode --checkpoint is scaffolded but not yet executable"); if(o.mode=="encode")return encode(o); if(o.mode=="decode")return decode(o); die("unknown mode");}catch(const exception&e){cerr<<"fsoy: "<<e.what()<<"\n"; return 1;}}
