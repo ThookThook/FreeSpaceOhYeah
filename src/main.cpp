@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 using namespace std; namespace fs=std::filesystem;
-constexpr int W=1920,H=1080,BLOCK=4,FPS=24; constexpr size_t BLOCKS=(W/BLOCK)*(H/BLOCK), BYTES_PER_FRAME=BLOCKS/8;
+constexpr int W=1920,H=1080,BLOCK=4,FPS=24; constexpr size_t BLOCKS=(W/BLOCK)*(H/BLOCK), BYTES_PER_FRAME=BLOCKS/8, CHUNK_SIZE=1024, ECC_GROUP=10;
 struct Opt{string mode,input,output,checkpoint,gpu="off",gpu_plugin; vector<string> inputs; uint64_t max_size=0; bool resume=false, ckdecode=false, auto_continue=false;};
 void die(const string&s){throw runtime_error(s);}
 string normalize_gpu_mode(const string& mode){
@@ -24,6 +24,7 @@ string normalize_gpu_mode(const string& mode){
  return "off";
 } bool have_ffmpeg(){return system("command -v ffmpeg >/dev/null 2>&1")==0;} uint64_t parse_size(string s){uint64_t m=1; char c=s.empty()?0:s.back(); if(!isdigit(c)){s.pop_back(); if(c=='K')m=1024; else if(c=='M')m=1024ull*1024; else if(c=='G')m=1024ull*1024*1024; else die("bad size suffix");} return stoull(s)*m;}
 void put64(vector<uint8_t>&v,uint64_t x){for(int i=0;i<8;i++)v.push_back((x>>(i*8))&255);} uint64_t get64(const vector<uint8_t>&v,size_t p){uint64_t x=0; for(int i=7;i>=0;i--)x=(x<<8)|v[p+i]; return x;}
+uint32_t checksum32(const uint8_t* data,size_t n){uint32_t h=2166136261u; for(size_t i=0;i<n;i++){h^=data[i]; h*=16777619u;} return h;}
 array<uint8_t,32> file_sha(const string&p){ifstream f(p,ios::binary); if(!f)die("cannot open "+p); Sha256 s; vector<uint8_t>b(1<<20); while(f){f.read((char*)b.data(),b.size()); if(f.gcount())s.update(b.data(),f.gcount());} return s.final();}
 string json_escape(const string&s){string o; for(char ch:s){if(ch=='\\'||ch=='"') {o.push_back('\\'); o.push_back(ch);} else if(ch=='\n') o+="\\n"; else o.push_back(ch);} return o;}
 string checkpoint_field(const string&path,const string&key){ifstream f(path); if(!f)die("cannot open checkpoint "+path); string data((istreambuf_iterator<char>(f)),{}); string needle="\""+key+"\""; size_t p=data.find(needle); if(p==string::npos)return {}; p=data.find(':',p); if(p==string::npos)return {}; p=data.find('"',p); if(p==string::npos)return {}; size_t e=data.find('"',p+1); if(e==string::npos)return {}; return data.substr(p+1,e-p-1);}
