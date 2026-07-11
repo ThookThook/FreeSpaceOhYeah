@@ -155,7 +155,7 @@ The executable has two active modes:
 - 1920×1080, 24 fps, H.264 Main Profile MP4 through FFmpeg.
 - Streaming feed to FFmpeg; the full set of video frames is not materialized as image files.
 - File-level SHA-256 verification on decode.
-- GPU support is an optional NVIDIA add-on library. `--gpu auto` / `--gpu frames` loads the add-on for luma frame synthesis when a CUDA driver is present; `--gpu encode` attempts FFmpeg NVENC and falls back to CPU `libx264`.
+- GPU acceleration is organized as optional GPU Suites. The current work-in-progress suite is the NVIDIA GPU Suite; future suites could use the same idea for other vendors, such as an AMD GPU Suite. `--gpu process` / `--gpu do-all` / `--gpu auto` / `--gpu frames` loads the NVIDIA GPU Suite add-on for luma frame synthesis when a CUDA driver is present; `--gpu encode` attempts FFmpeg NVENC and falls back to CPU `libx264`.
 
 ## Current limitations
 
