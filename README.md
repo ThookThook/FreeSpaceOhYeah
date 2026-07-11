@@ -6,20 +6,20 @@
 
 - A C++20 compiler and CMake 3.16 or newer.
 - `ffmpeg` available on `PATH`. Both `encode` and `decode` call `ffmpeg` at runtime.
-- Optional GPU Suite support:
+- Optional NVIDIA/CUDA support:
   - The main CLI does **not** require CUDA to build or run.
-  - If CMake finds NVCC/CUDA, the current NVIDIA GPU Suite (`fsoy_nvidia_gpu`) shared library builds with a CUDA luma-frame kernel.
-  - If CUDA is not found, the same NVIDIA GPU Suite shared-library target builds as a driver-detecting stub so the CLI still compiles.
-  - Runtime NVIDIA GPU Suite frame synthesis requires the plugin shared library and a CUDA-capable NVIDIA driver/device.
-  - Runtime NVIDIA GPU Suite video encoding requires an FFmpeg build with NVENC support and compatible NVIDIA hardware/driver.
+  - If CMake finds NVCC/CUDA, the optional `fsoy_nvidia_gpu` shared library builds with a CUDA luma-frame kernel.
+  - If CUDA is not found, the same optional shared-library target builds as a driver-detecting stub so the CLI still compiles.
+  - Runtime GPU frame synthesis requires the plugin shared library and a CUDA-capable NVIDIA driver/device.
+  - Runtime GPU video encoding requires an FFmpeg build with NVENC support and compatible NVIDIA hardware/driver.
 
 ## Build commands
 
 | Command | Purpose | Requirements | Notes / disabling conditions |
 | --- | --- | --- | --- |
-| `cmake -S . -B build` | Configures the project and generates build files in `build/`. | CMake 3.16+ and a C++20 compiler. | By default, CMake tries to build the optional NVIDIA GPU Suite plugin target. Add `-DFSOY_BUILD_NVIDIA_PLUGIN=OFF` to disable that target completely. |
-| `cmake -S . -B build -DFSOY_BUILD_NVIDIA_PLUGIN=OFF` | Configures the project without the optional NVIDIA GPU Suite add-on library. | CMake 3.16+ and a C++20 compiler. | Use this when you do not want any GPU plugin library built. The CLI remains usable with CPU frame synthesis and CPU FFmpeg encoding. |
-| `cmake --build build` | Compiles the `fsoy` CLI and, unless disabled, the optional NVIDIA GPU Suite plugin shared library. | A successfully configured `build/` directory. | If CUDA is unavailable but the plugin target is enabled, the plugin is built from the CPU stub source instead of the CUDA source. |
+| `cmake -S . -B build` | Configures the project and generates build files in `build/`. | CMake 3.16+ and a C++20 compiler. | By default, CMake tries to build the optional NVIDIA plugin target. Add `-DFSOY_BUILD_NVIDIA_PLUGIN=OFF` to disable that target completely. |
+| `cmake -S . -B build -DFSOY_BUILD_NVIDIA_PLUGIN=OFF` | Configures the project without the optional NVIDIA GPU add-on library. | CMake 3.16+ and a C++20 compiler. | Use this when you do not want any GPU plugin library built. The CLI remains usable with CPU frame synthesis and CPU FFmpeg encoding. |
+| `cmake --build build` | Compiles the `fsoy` CLI and, unless disabled, the optional NVIDIA plugin shared library. | A successfully configured `build/` directory. | If CUDA is unavailable but the plugin target is enabled, the plugin is built from the CPU stub source instead of the CUDA source. |
 | `cmake --install build` | Installs the compiled CLI and optional plugin to the configured install prefix. | A successfully built `build/` directory. | Optional. The CLI can also be run directly from `./build/fsoy`. |
 
 ## CLI command overview
@@ -47,36 +47,32 @@ The executable has two active modes:
 - **Output side effect:** Writes `archive.mp4.checkpoint` next to the MP4. The checkpoint records the source path, source size, SHA-256, HARE parameters, output list, and completion status.
 - **Disable conditions:** This command is not available if `ffmpeg` is missing. It also fails if the input cannot be opened or the output path cannot be written.
 
-### Encode with the NVIDIA GPU Suite process mode
+### Encode with automatic GPU assistance
 
 ```bash
-./build/fsoy encode archive.7z -o archive.mp4 --gpu process
-# Alias with the same behavior:
-./build/fsoy encode archive.7z -o archive.mp4 --gpu do-all
-# Existing compatibility spelling:
 ./build/fsoy encode archive.7z -o archive.mp4 --gpu auto
 ```
 
-- **What it does:** Attempts to use the NVIDIA GPU Suite plugin for luma-frame synthesis and attempts NVENC for H.264 encoding. If either GPU path is unavailable, the CLI falls back to CPU behavior where possible.
-- **What it is for:** The “do as much GPU processing as this prototype currently supports” mode. `process`, `do-all`, and `auto` currently mean the same thing.
-- **Requirements:** Same as basic encode. NVIDIA GPU Suite acceleration additionally requires the plugin shared library to be loadable and a compatible NVIDIA driver/device. NVENC additionally requires FFmpeg NVENC support.
+- **What it does:** Attempts to use the NVIDIA plugin for luma-frame synthesis and attempts NVENC for H.264 encoding. If either GPU path is unavailable, the CLI falls back to CPU behavior where possible.
+- **What it is for:** A convenient “try GPU, but keep working” mode.
+- **Requirements:** Same as basic encode. GPU acceleration additionally requires the plugin shared library to be loadable and a compatible NVIDIA driver/device. NVENC additionally requires FFmpeg NVENC support.
 - **Fallback behavior:** If the luma-frame plugin is missing or unavailable, CPU frame synthesis is used. If NVENC encoding fails, the encode is retried with CPU `libx264`.
-- **Disable conditions:** NVIDIA GPU Suite acceleration is effectively disabled when the plugin cannot be loaded, the plugin reports no available CUDA device/driver, FFmpeg lacks NVENC support, or compatible NVIDIA hardware/driver support is absent. The overall encode still works if CPU fallback requirements are met.
+- **Disable conditions:** GPU acceleration is effectively disabled when the plugin cannot be loaded, the plugin reports no available CUDA device/driver, FFmpeg lacks NVENC support, or compatible NVIDIA hardware/driver support is absent. The overall encode still works if CPU fallback requirements are met.
 
-### Encode with NVIDIA GPU Suite frame synthesis only
+### Encode with GPU frame synthesis only
 
 ```bash
 ./build/fsoy encode archive.7z -o archive.mp4 --gpu frames --gpu-plugin ./build/libfsoy_nvidia_gpu.so
 ```
 
-- **What it does:** Attempts to load the named NVIDIA GPU Suite plugin and use it for luma-frame synthesis. Video encoding remains CPU `libx264`.
+- **What it does:** Attempts to load the named GPU plugin and use it for luma-frame synthesis. Video encoding remains CPU `libx264`.
 - **What it is for:** Testing or using GPU frame generation without relying on NVENC video encoding.
-- **Requirements:** Same as basic encode. NVIDIA GPU Suite frame synthesis additionally requires a loadable plugin path and compatible NVIDIA runtime support.
+- **Requirements:** Same as basic encode. GPU frame synthesis additionally requires a loadable plugin path and compatible NVIDIA runtime support.
 - **Plugin path:** `--gpu-plugin` is optional. When omitted, the loader uses its built-in default lookup behavior. When supplied, it should point to the built shared library, such as `./build/libfsoy_nvidia_gpu.so` on Linux, `./build/fsoy_nvidia_gpu.dll` on Windows, or `./build/libfsoy_nvidia_gpu.dylib` on macOS.
 - **Fallback behavior:** If the plugin cannot be loaded or reports unavailable, CPU frame synthesis is used.
 - **Disable conditions:** GPU frame synthesis is disabled when `--gpu off` is used, when the plugin target was not built, when `--gpu-plugin` points to a missing/incompatible library, or when no compatible CUDA driver/device is available.
 
-### Encode with NVIDIA GPU Suite video encoding only
+### Encode with GPU video encoding only
 
 ```bash
 ./build/fsoy encode archive.7z -o archive.mp4 --gpu encode
@@ -143,15 +139,15 @@ The executable has two active modes:
 - **Requirements:** A checkpoint path must be supplied.
 - **Disable conditions:** Checkpoint-assisted decode is always disabled in the current prototype and will report that it is not yet executable.
 
-## GPU Suite option reference
+## GPU option reference
 
 | Option | Active with | Purpose | Requirements | Fallback / disabled behavior |
 | --- | --- | --- | --- | --- |
 | `--gpu off` | `encode` | Forces CPU frame synthesis and CPU `libx264` encoding. This is also the default when `--gpu` is omitted. | `ffmpeg` with `libx264` support. | Disables all optional GPU paths. |
-| `--gpu process` / `--gpu do-all` / `--gpu auto` | `encode` | Tries NVIDIA GPU Suite frame synthesis through the plugin and NVENC video encoding through FFmpeg. | Plugin and CUDA runtime for frame synthesis; FFmpeg NVENC and NVIDIA hardware/driver for encode acceleration. | Falls back to CPU frame synthesis and retries CPU `libx264` encoding if GPU paths are unavailable. |
-| `--gpu frames` | `encode` | Tries NVIDIA GPU Suite luma-frame synthesis only. | Loadable plugin and compatible NVIDIA CUDA driver/device. | Falls back to CPU frame synthesis; video encoding remains CPU `libx264`. |
-| `--gpu encode` | `encode` | Tries NVIDIA GPU Suite FFmpeg NVENC video encoding only. | FFmpeg with `h264_nvenc` and compatible NVIDIA hardware/driver. | Retries with CPU `libx264` if NVENC fails. |
-| `--gpu-plugin <path>` | `encode` with `--gpu process`, `--gpu do-all`, `--gpu auto`, or `--gpu frames` | Selects the GPU plugin shared library to load. | Path to a compatible `fsoy_nvidia_gpu` shared library. | Ignored unless GPU frame synthesis is requested. If missing or invalid, CPU frame synthesis is used. |
+| `--gpu auto` | `encode` | Tries GPU frame synthesis through the plugin and NVENC video encoding through FFmpeg. | Plugin and CUDA runtime for frame synthesis; FFmpeg NVENC and NVIDIA hardware/driver for encode acceleration. | Falls back to CPU frame synthesis and retries CPU `libx264` encoding if GPU paths are unavailable. |
+| `--gpu frames` | `encode` | Tries GPU luma-frame synthesis only. | Loadable plugin and compatible NVIDIA CUDA driver/device. | Falls back to CPU frame synthesis; video encoding remains CPU `libx264`. |
+| `--gpu encode` | `encode` | Tries FFmpeg NVENC video encoding only. | FFmpeg with `h264_nvenc` and compatible NVIDIA hardware/driver. | Retries with CPU `libx264` if NVENC fails. |
+| `--gpu-plugin <path>` | `encode` with `--gpu auto` or `--gpu frames` | Selects the GPU plugin shared library to load. | Path to a compatible `fsoy_nvidia_gpu` shared library. | Ignored unless GPU frame synthesis is requested. If missing or invalid, CPU frame synthesis is used. |
 
 ## HARE v1 choices in this prototype
 
@@ -163,4 +159,4 @@ The executable has two active modes:
 
 ## Current limitations
 
-The repository contains the runnable scaffold for v1, but full rateless/Tornado ECC recovery, executable checkpoint resume, checkpoint-assisted decode, and true multi-volume splitting are still implementation TODOs. When CMake finds NVCC/CUDA, the NVIDIA GPU Suite add-on builds a CUDA kernel for luma frame synthesis; otherwise it builds a driver-detecting stub so the main CLI still compiles without a GPU toolchain.
+The repository contains the runnable scaffold for v1, but full rateless/Tornado ECC recovery, executable checkpoint resume, checkpoint-assisted decode, and true multi-volume splitting are still implementation TODOs. When CMake finds NVCC/CUDA, the NVIDIA add-on builds a CUDA kernel for luma frame synthesis; otherwise it builds a driver-detecting stub so the main CLI still compiles without a GPU toolchain.
