@@ -5,8 +5,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(fsoy src/main.cpp src/gpu_loader.cpp src/gpu_loader.h src/sha256.cpp src/sha256.h)
 target_include_directories(fsoy PRIVATE include src)
-if(UNIX)
+
+if(DEFINED ENV{PREFIX} AND "$ENV{PREFIX}" MATCHES "com\\.termux")
+  set(IS_TERMUX TRUE)
+else()
+  set(IS_TERMUX FALSE)
+endif()
+
+if(UNIX AND NOT IS_TERMUX)
   target_link_libraries(fsoy PRIVATE pthread dl)
+elseif(IS_TERMUX)
+  target_link_libraries(fsoy PRIVATE pthread)
 endif()
 
 option(FSOY_BUILD_NVIDIA_PLUGIN "Build the optional NVIDIA GPU add-on library" ON)
