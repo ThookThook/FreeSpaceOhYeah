@@ -4,12 +4,14 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -32,6 +34,13 @@ string normalize_gpu_mode(const string& mode){
 void put64(vector<uint8_t>&v,uint64_t x){for(int i=0;i<8;i++)v.push_back((x>>(i*8))&255);} uint64_t get64(const vector<uint8_t>&v,size_t p){uint64_t x=0; for(int i=7;i>=0;i--)x=(x<<8)|v[p+i]; return x;}
 void put32(vector<uint8_t>&v,uint32_t x){for(int i=0;i<4;i++)v.push_back((x>>(i*8))&255);} uint32_t get32(const vector<uint8_t>&v,size_t p){uint32_t x=0; for(int i=3;i>=0;i--)x=(x<<8)|v[p+i]; return x;}
 uint32_t checksum32(const uint8_t* data,size_t n){uint32_t h=2166136261u; for(size_t i=0;i<n;i++){h^=data[i]; h*=16777619u;} return h;}
+string human_size(uint64_t bytes){
+ static const char* units[]={"B","KB","MB","GB","TB"};
+ double v=(double)bytes; int u=0;
+ while(v>=1024.0 && u<4){v/=1024.0; u++;}
+ ostringstream o; o<<fixed<<setprecision(u==0?0:1)<<v<<" "<<units[u];
+ return o.str();
+}
 array<uint8_t,32> file_sha(const string&p){ifstream f(p,ios::binary); if(!f)die("cannot open "+p); Sha256 s; vector<uint8_t>b(1<<20); while(f){f.read((char*)b.data(),b.size()); if(f.gcount())s.update(b.data(),f.gcount());} return s.final();}
 // HARE v1 stream layout: magic(9) | orig_size u64(8) | sha256(32) | num_data_chunks u64(8) | chunk_size u32(4) | ecc_group u32(4)
 // then per ECC group: g data chunks of [checksum32(4) + chunk_size bytes], followed by one parity chunk [checksum32(4) + chunk_size bytes]
@@ -196,21 +205,52 @@ int encode(const Opt&o){
  if(o.gpu=="auto") cerr<<"GPU process suite requested; frame synthesis and NVENC will be attempted with CPU fallback where possible.\n";
  if(o.gpu=="encode") cerr<<"GPU encode requested; NVENC will be attempted and CPU libx264 used if unavailable.\n";
  uint64_t sz; array<uint8_t,32> sha; vector<uint8_t> payload=build_hare_stream(o.input,sz,sha);
+ uint64_t total_frames = payload.empty()?0:(payload.size()+BYTES_PER_FRAME-1)/BYTES_PER_FRAME;
+ // Upfront estimate. We know the exact frame count (and thus video duration) before encoding, since
+ // that's purely a function of payload size. We can NOT know the exact compressed output size ahead
+ // of time -- that depends on how compressible the data's bit pattern turns out to be under lossless
+ // x264 -- so we say that plainly instead of printing a fake number.
+ cerr<<"Input: "<<human_size(sz)<<" -> HARE payload "<<human_size(payload.size())<<" (with ECC overhead)\n";
+ cerr<<"Will encode "<<total_frames<<" frame(s), ~"<<fixed<<setprecision(1)<<((double)total_frames/FPS)<<"s of video @ "<<FPS<<"fps. "
+     <<"Final compressed size depends on data entropy and isn't known until encoding finishes.\n";
  Proc proc=spawn_argv(ffmpeg_encode_args(o.output,o.gpu),"w");
  fprintf(proc.f,"YUV4MPEG2 W%d H%d F%d:1 Ip A1:1 C420jpeg\n",W,H,FPS);
- for(size_t off=0;off<payload.size();off+=BYTES_PER_FRAME) write_frame(proc.f,payload,off,frame_gpu);
+ // Live progress -- frame count is exact (we're the ones writing them), and every so often we also
+ // stat() the output file on disk to show how large the compressed video has grown so far (works
+ // because -movflags +frag_keyframe+empty_moov makes ffmpeg flush data incrementally instead of
+ // buffering everything until a final moov write at the end).
+ uint64_t frame_i=0; auto last=chrono::steady_clock::now(); bool any_progress_line=false;
+ for(size_t off=0;off<payload.size();off+=BYTES_PER_FRAME){
+  write_frame(proc.f,payload,off,frame_gpu); frame_i++;
+  auto now=chrono::steady_clock::now();
+  if(chrono::duration_cast<chrono::milliseconds>(now-last).count()>=500 || frame_i==total_frames){
+   last=now; any_progress_line=true;
+   error_code ec; uint64_t cur=fs::file_size(o.output,ec);
+   double pct = total_frames? (100.0*(double)frame_i/(double)total_frames) : 100.0;
+   cerr<<"\rEncoding: frame "<<frame_i<<"/"<<total_frames<<" ("<<fixed<<setprecision(1)<<pct<<"%) -- "
+       <<"output so far: "<<(ec?string("0 B"):human_size(cur))<<"          "<<flush;
+  }
+ }
+ if(any_progress_line) cerr<<"\n";
  int rc=close_proc(proc);
  if(rc!=0 && (o.gpu=="auto"||o.gpu=="encode")){ cerr<<"GPU encode failed; retrying with CPU libx264.\n"; Opt c=o; c.gpu="off"; return encode(c);}
  if(rc!=0){ encode_checkpoint(o.output+".encode.checkpoint",o.input,o.output,sz,sha,"failed",payload.size()); die("ffmpeg encode failed"); }
  encode_checkpoint(o.output+".encode.checkpoint",o.input,o.output,sz,sha,"complete",payload.size());
+ error_code ec; uint64_t final_sz=fs::file_size(o.output,ec);
+ if(!ec) cerr<<"Done. Final output size: "<<human_size(final_sz)<<"\n";
  return 0;
 }
-// Reads one input video fully into out_bytes via ffmpeg, appending decoded bits.
-// Returns false (leaving out_bytes untouched) if ffmpeg exits non-zero, so a
-// failed attempt never contaminates the accumulated stream with partial data.
-bool decode_frames(const vector<string>&args,vector<uint8_t>&out_bytes){
+// Reads one input video fully into out_bytes via ffmpeg, appending decoded bits. Returns false (leaving
+// out_bytes untouched) if ffmpeg exits non-zero, so a failed attempt never contaminates the accumulated
+// stream with partial data. label is just the input filename, used for progress-line prefixing.
+bool decode_frames(const vector<string>&args,vector<uint8_t>&out_bytes,const string&label){
  Proc proc=spawn_argv(args,"r");
  vector<uint8_t> y(W*H), local;
+ uint64_t frame_i=0; auto last=chrono::steady_clock::now(); bool any_progress_line=false;
+ // Live progress. Unlike encode, decode can't know the total frame count of an input video up front
+ // without a separate ffprobe-style pass, so this reports running counts (frames read so far, bytes
+ // reconstructed so far) rather than a percentage -- still far better than the previous complete
+ // silence during what can be a multi-second-to-multi-minute read for large inputs.
  while(fread(y.data(),1,y.size(),proc.f)==y.size()){
   uint8_t cur=0; int n=0;
   for(size_t bi=0;bi<BLOCKS;bi++){
@@ -218,7 +258,14 @@ bool decode_frames(const vector<string>&args,vector<uint8_t>&out_bytes){
    cur=(cur<<1)|(y[by*W+bx]>127);
    if(++n==8){ local.push_back(cur); cur=0; n=0; }
   }
+  frame_i++;
+  auto now=chrono::steady_clock::now();
+  if(chrono::duration_cast<chrono::milliseconds>(now-last).count()>=500){
+   last=now; any_progress_line=true;
+   cerr<<"\rDecoding "<<label<<": frame "<<frame_i<<" read, "<<human_size(local.size())<<" reconstructed so far          "<<flush;
+  }
  }
+ if(any_progress_line) cerr<<"\rDecoding "<<label<<": frame "<<frame_i<<" read, "<<human_size(local.size())<<" reconstructed so far          \n";
  int rc=close_proc(proc);
  if(rc!=0) return false;
  out_bytes.insert(out_bytes.end(),local.begin(),local.end());
@@ -226,36 +273,38 @@ bool decode_frames(const vector<string>&args,vector<uint8_t>&out_bytes){
 }
 int decode(const Opt&o){
  if(!have_ffmpeg()) die("ffmpeg is required on PATH for MP4 encode/decode");
- // FIX: the original decode() never looked at o.gpu at all, so --gpu process/auto/decode
- // silently did nothing and every decode ran on CPU regardless of the flag, contradicting
- // the documented "attempts CUDA hwaccel decode, falls back to CPU" behavior. This now
- // actually attempts hwaccel decode per input and falls back to CPU on failure.
+ // The original decode() never looked at o.gpu at all, so --gpu process/auto/decode silently did
+ // nothing and every decode ran on CPU regardless of the flag, contradicting the documented "attempts
+ // CUDA hwaccel decode, falls back to CPU" behavior. This actually attempts hwaccel decode per input
+ // and falls back to CPU on failure.
  bool want_gpu=(o.gpu=="auto"||o.gpu=="decode");
  if(want_gpu) cerr<<"GPU decode requested; FFmpeg CUDA hwaccel will be attempted per input, with CPU fallback.\n";
  vector<uint8_t> bytes;
  for(auto&in:o.inputs){
+  error_code ec; uint64_t in_sz=fs::file_size(in,ec);
+  cerr<<"Reading "<<in<<(ec?string():" ("+human_size(in_sz)+")")<<"...\n";
   bool ok=false;
   if(want_gpu){
-   ok=decode_frames(ffmpeg_decode_args(in,true),bytes);
+   ok=decode_frames(ffmpeg_decode_args(in,true),bytes,in);
    if(!ok) cerr<<"GPU decode failed for "<<in<<"; retrying with CPU decode.\n";
   }
-  if(!ok) ok=decode_frames(ffmpeg_decode_args(in,false),bytes);
+  if(!ok) ok=decode_frames(ffmpeg_decode_args(in,false),bytes,in);
   if(!ok) die("ffmpeg failed to decode input "+in);
  }
+ cerr<<"Reassembling and verifying HARE stream ("<<human_size(bytes.size())<<" of decoded frame data)...\n";
  uint64_t sz; array<uint8_t,32> sha{};
  vector<uint8_t> payload=reconstruct_hare_stream(bytes,sz,sha);
  ofstream out(o.output,ios::binary); out.write((char*)payload.data(),(streamsize)payload.size()); out.close();
  auto got=file_sha(o.output);
  if(got!=sha){ decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(sha),"failed"); die("SHA-256 verification failed: got "+Sha256::hex(got)+" expected "+Sha256::hex(sha)); }
  decode_checkpoint(o.output+".decode.checkpoint",o.inputs,o.output,sz,Sha256::hex(got),"complete");
- cerr<<"Verified SHA-256 "<<Sha256::hex(got)<<"\n";
+ cerr<<"Done. Output size: "<<human_size(sz)<<". Verified SHA-256 "<<Sha256::hex(got)<<"\n";
  return 0;
 }
 Opt parse(int argc,char**argv){ if(argc<2)die("usage: fsoy encode <file> -o <out.mp4> | fsoy decode <mp4...> -o <file>"); Opt o; o.mode=argv[1]; for(int i=2;i<argc;i++){string a=argv[i]; if(a=="-o"&&i+1<argc)o.output=argv[++i]; else if(a=="--gpu"&&i+1<argc)o.gpu=normalize_gpu_mode(argv[++i]); else if(a=="--gpu-plugin"&&i+1<argc)o.gpu_plugin=argv[++i]; else if(a=="--max-output-size"&&i+1<argc)o.max_size=parse_size(argv[++i]); else if(a=="--auto-continue")o.auto_continue=true; else if(a=="--resume"&&i+1<argc){o.resume=true; o.checkpoint=argv[++i];} else if(a=="--checkpoint"&&i+1<argc){o.ckdecode=true; o.checkpoint=argv[++i];} else if(o.mode=="decode")o.inputs.push_back(a); else if(o.input.empty())o.input=a; else die("unexpected arg "+a);} if(o.mode=="encode"&&!o.resume&&(o.input.empty()||o.output.empty()))die("encode needs input and -o"); if(o.mode=="decode"&&(o.inputs.empty()||o.output.empty()))die("decode needs input video(s) and -o"); return o;}
 int main(int argc,char**argv){
- signal(SIGPIPE,SIG_IGN); // FIX: without this, writing frames to ffmpeg after it exits early
-                          // (e.g. a bad encoder arg) delivers SIGPIPE, whose default action
-                          // kills this process outright instead of letting us see/report the
-                          // failure via the ffmpeg exit code.
+ signal(SIGPIPE,SIG_IGN); // Without this, writing frames to ffmpeg after it exits early (e.g. a bad
+                          // encoder arg) delivers SIGPIPE, whose default action kills this process
+                          // outright instead of letting us see/report the failure via ffmpeg's exit code.
  try{Opt o=parse(argc,argv); if(o.max_size) cerr<<"--max-output-size is recorded in checkpoint; v1 scaffold writes one feed volume.\n"; if(o.resume) die("resume from checkpoint is scaffolded but not yet executable"); if(o.ckdecode) die("decode --checkpoint is scaffolded but not yet executable"); if(o.mode=="encode")return encode(o); if(o.mode=="decode")return decode(o); die("unknown mode");}catch(const exception&e){cerr<<"fsoy: "<<e.what()<<"\n"; return 1;}
 }
