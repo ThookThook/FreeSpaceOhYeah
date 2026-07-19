@@ -20,7 +20,7 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/wait.h>
-using namespace std; namespace fs=std::filesystem;
+using namespace std; namespace fs=std::filesystem; //
 // v2 defaults: 1x1 tile (one payload bit per pixel, no 4x4 blocking), 2-color (B/W) palette.
 // W/H/FPS stay fixed constants (matches the "assume 1080p" design); tile/palette are runtime
 // values because they're now recorded in the stream header itself (see build_fsoy_stream) so a
